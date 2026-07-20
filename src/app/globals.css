@@ -1,0 +1,85 @@
+@import "tailwindcss";
+
+/* ============================================================
+   LUMIÈRE — design tokens (Tailwind v4 CSS-first theme)
+   ============================================================ */
+@theme {
+  --color-wine: #7a2e35;
+  --color-wine-dark: #5c1f26;
+  --color-gold: #c8a24d;
+  --color-gold-soft: #e0c079;
+  --color-ink: #16130f;
+  --color-ink-soft: #201b14;
+  --color-cream: #faf6ef;
+  --color-cream2: #f3ead9;
+
+  --font-display: var(--font-cormorant), Georgia, serif;
+  --font-serif: var(--font-playfair), Georgia, serif;
+  --font-sans: var(--font-poppins), system-ui, sans-serif;
+
+  --shadow-soft: 0 8px 40px rgba(0, 0, 0, 0.1);
+  --shadow-lg: 0 20px 60px rgba(0, 0, 0, 0.18);
+}
+
+:root {
+  --background: #ffffff;
+  --foreground: #2a2a2a;
+}
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  overflow-x: hidden;
+}
+h1, h2, h3, h4, h5 { font-family: var(--font-serif); color: var(--color-ink); }
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-thumb { background: var(--color-gold); border-radius: 10px; }
+::selection { background: var(--color-gold); color: var(--color-ink); }
+
+.section-label {
+  font-family: var(--font-sans); text-transform: uppercase; letter-spacing: 3px;
+  font-size: 0.72rem; font-weight: 600; color: var(--color-gold);
+}
+.gold-line {
+  width: 64px; height: 3px; border-radius: 3px;
+  background: linear-gradient(90deg, var(--color-gold), var(--color-gold-soft));
+}
+.btn-gold {
+  display: inline-flex; align-items: center; gap: 0.5rem;
+  background: linear-gradient(135deg, var(--color-gold), #b3873a);
+  color: var(--color-ink); font-weight: 600; padding: 0.8rem 1.6rem; border-radius: 999px;
+  box-shadow: 0 8px 22px rgba(200, 162, 77, 0.35); transition: transform 0.25s, filter 0.25s;
+}
+.btn-gold:hover { transform: translateY(-2px); filter: brightness(1.06); }
+.btn-wine {
+  display: inline-flex; align-items: center; gap: 0.5rem;
+  background: linear-gradient(135deg, var(--color-wine), var(--color-wine-dark));
+  color: #fff; font-weight: 600; padding: 0.8rem 1.6rem; border-radius: 999px;
+  box-shadow: 0 8px 22px rgba(122, 46, 53, 0.3); transition: transform 0.25s, filter 0.25s;
+}
+.btn-wine:hover { transform: translateY(-2px); filter: brightness(1.08); }
+.btn-outline {
+  display: inline-flex; align-items: center; gap: 0.5rem;
+  border: 1.5px solid var(--color-gold); color: var(--color-ink);
+  padding: 0.75rem 1.55rem; border-radius: 999px; font-weight: 600; transition: all 0.25s;
+}
+.btn-outline:hover { background: var(--color-gold); color: var(--color-ink); }
+.field {
+  width: 100%; padding: 0.8rem 1rem; border-radius: 12px; border: 1px solid #e3dccf;
+  background: #fff; font-size: 0.9rem; color: #2a2a2a; transition: border-color 0.2s, box-shadow 0.2s;
+}
+.field:focus { outline: none; border-color: var(--color-gold); box-shadow: 0 0 0 3px rgba(200, 162, 77, 0.18); }
+
+#scroll-progress {
+  position: fixed; top: 0; left: 0; height: 3px; width: 0; z-index: 200;
+  background: linear-gradient(90deg, var(--color-gold), var(--color-gold-soft), var(--color-gold));
+  box-shadow: 0 0 12px rgba(200, 162, 77, 0.6);
+}
+.marquee-track { display: flex; gap: 3rem; width: max-content; animation: marquee 28s linear infinite; }
+@keyframes marquee { to { transform: translateX(-50%); } }
+@keyframes plspin { to { transform: rotate(360deg); } }
+@keyframes plload { 0% { transform: translateX(-120%); } 100% { transform: translateX(360%); } }
+@media (prefers-reduced-motion: reduce) { .marquee-track { animation: none; } * { scroll-behavior: auto; } }
