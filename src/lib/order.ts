@@ -16,6 +16,10 @@ export type MenuItem = {
   prep_minutes: number;
   available: boolean;
   sort: number;
+  wine_pairing?: string | null;
+  origin?: string | null;
+  dietary?: string[] | null;
+  spice?: number | null;
 };
 
 export type OrderLine = {

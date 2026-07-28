@@ -40,7 +40,7 @@ async function settle(token: string, ref: string, method: string): Promise<{ ok:
   if (!sess) return { ok: false, error: "Session not found." };
 
   const { data: orders } = await admin.from("session_orders").select("amount").eq("session_id", sess.id);
-  const amount = (orders ?? []).reduce((s, o) => s + Number(o.amount), 0);
+  const amount = (orders ?? []).reduce((s, o) => s + Number(o.amount), 0) + Number(sess.tip || 0);
 
   if (sess.payment_status === "paid" && sess.receipt_code) {
     return { ok: true, receipt: { code: sess.receipt_code, amount, table: table.label, method } };
@@ -60,12 +60,26 @@ async function settle(token: string, ref: string, method: string): Promise<{ ok:
   return { ok: true, receipt: { code, amount, table: table.label, method } };
 }
 
+// Persist a tip on the open session so settle() charges + records it.
+async function setSessionTip(token: string, tip: number) {
+  if (!serviceRoleConfigured() || tip <= 0) return;
+  const admin = createAdminClient();
+  const { data: table } = await admin.from("restaurant_tables").select("id").eq("token", token).single();
+  if (!table) return;
+  const { data: sess } = await admin.from("dining_sessions").select("id")
+    .eq("table_id", table.id).in("status", ["open", "bill_pending"])
+    .order("created_at", { ascending: false }).limit(1).single();
+  if (sess) await admin.from("dining_sessions").update({ tip }).eq("id", sess.id);
+}
+
 // ---- Start a payment (gateway chosen by PAYMENT_GATEWAY env) ----
-export async function startBillPayment(token: string): Promise<StartResult> {
+export async function startBillPayment(token: string, tip = 0): Promise<StartResult> {
   const bill = await billTotal(token);
   if (!bill) return { ok: false, error: "No open bill for this table." };
   if (bill.total <= 0) return { ok: false, error: "Your bill is empty." };
-  const paise = Math.round(bill.total * 100);
+  const t = Number.isFinite(tip) && tip > 0 ? Math.round(tip) : 0;
+  await setSessionTip(token, t);
+  const paise = Math.round((bill.total + t) * 100);
 
   if (GATEWAY() === "razorpay") {
     const keyId = process.env.RAZORPAY_KEY_ID;

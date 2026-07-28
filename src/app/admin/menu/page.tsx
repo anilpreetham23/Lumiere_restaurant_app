@@ -14,7 +14,7 @@ export default function MenuAdminPage() {
   const supabase = useMemo(() => createClient(), []);
   const [items, setItems] = useState<MenuItem[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
-  const [form, setForm] = useState({ title: "", cuisine: "France", price: "", short: "", image: "" });
+  const [form, setForm] = useState({ title: "", cuisine: "France", price: "", short: "", image: "", dietary: "", spice: "0" });
   const [adding, setAdding] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
@@ -44,10 +44,11 @@ export default function MenuAdminPage() {
     const price = Number(form.price);
     if (!Number.isFinite(price) || price < 0) { setErr("Enter a valid price."); return; }
     setAdding(true);
-    const res = await addMenuItem({ title: form.title, cuisine: form.cuisine, price, short: form.short, image: form.image });
+    const dietary = form.dietary.split(",").map((s) => s.trim()).filter(Boolean);
+    const res = await addMenuItem({ title: form.title, cuisine: form.cuisine, price, short: form.short, image: form.image, dietary, spice: Number(form.spice) });
     setAdding(false);
     if (!res.ok) { setErr(res.error ?? "Could not add."); return; }
-    setForm({ title: "", cuisine: form.cuisine, price: "", short: "", image: "" });
+    setForm({ title: "", cuisine: form.cuisine, price: "", short: "", image: "", dietary: "", spice: "0" });
     load();
   }
   async function del(it: MenuItem) {
@@ -80,6 +81,13 @@ export default function MenuAdminPage() {
           <button onClick={add} disabled={adding} className="btn-wine justify-center disabled:opacity-60">
             {adding ? <Loader2 className="animate-spin" size={16} /> : <Plus size={16} />} Add
           </button>
+          <input value={form.dietary} onChange={(e) => setForm({ ...form, dietary: e.target.value })} placeholder="Dietary tags, comma-sep (e.g. Veg, Vegan, GF)" className="field lg:col-span-4" />
+          <select value={form.spice} onChange={(e) => setForm({ ...form, spice: e.target.value })} className="field lg:col-span-2">
+            <option value="0">No spice</option>
+            <option value="1">Mild 🌶</option>
+            <option value="2">Medium 🌶🌶</option>
+            <option value="3">Hot 🌶🌶🌶</option>
+          </select>
           <input value={form.short} onChange={(e) => setForm({ ...form, short: e.target.value })} placeholder="Short description (optional)" className="field lg:col-span-6" />
         </div>
         {err && <p className="text-sm text-wine mt-2">{err}</p>}

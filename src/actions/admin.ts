@@ -74,6 +74,7 @@ export async function setMenuPrice(id: string, price: number) {
 
 export async function addMenuItem(input: {
   title: string; cuisine: string; price: number; image?: string; short?: string;
+  dietary?: string[]; spice?: number;
 }) {
   const supabase = await requireStaff();
   if (!supabase) return { ok: false, error: "Not authorised" };
@@ -92,11 +93,22 @@ export async function addMenuItem(input: {
     short: input.short?.trim() || title,
     description: input.short?.trim() || title,
     tags: [],
+    dietary: input.dietary ?? [],
+    spice: Number.isFinite(input.spice) ? input.spice : 0,
     sort: 999,
   };
   const { error } = await supabase.from("menu_items").insert(row);
   if (error) return { ok: false, error: error.message };
   revalidatePath("/admin/menu");
+  return { ok: true };
+}
+
+export async function updateSettings(patch: Record<string, unknown>) {
+  const supabase = await requireStaff();
+  if (!supabase) return { ok: false, error: "Not authorised" };
+  const { error } = await supabase.from("app_settings").update(patch).eq("id", 1);
+  if (error) return { ok: false, error: error.message };
+  revalidatePath("/admin/settings");
   return { ok: true };
 }
 
