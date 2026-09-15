@@ -2,7 +2,7 @@ export type Dish = {
   id: string;
   title: string;
   cuisine: "France" | "Italy" | "Japan" | "India" | "Spain" | "Patisserie";
-  price: number; // GBP
+  price: number; // INR
   image: string;
   short: string;
   description: string;
@@ -178,4 +178,9 @@ export const MENU: Dish[] = [
   },
 ];
 
-export const money = (n: number) => "₹" + n.toFixed(n % 1 === 0 ? 0 : 2);
+export const money = (n: number) =>
+  new Intl.NumberFormat("en-IN", {
+    style: "currency",
+    currency: "INR",
+    maximumFractionDigits: n % 1 === 0 ? 0 : 2,
+  }).format(n);
