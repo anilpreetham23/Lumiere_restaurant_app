@@ -201,7 +201,10 @@ export async function startBillPayment(token: string, tip = 0): Promise<StartRes
 }
 
 // Check status of a payment intent (used for frontend polling/verification)
-export async function checkPaymentIntentStatus(intentId: string, token: string): Promise<{
+export async function checkPaymentIntentStatus(
+  intentId: string,
+  tokenOrRid?: string
+): Promise<{
   ok: boolean;
   status: string;
   receipt?: Receipt;
@@ -213,13 +216,21 @@ export async function checkPaymentIntentStatus(intentId: string, token: string):
   const { data: intent } = await admin.from("payment_intents").select("*").eq("id", intentId).single();
   if (!intent) return { ok: false, status: "not_found", error: "Payment intent not found" };
 
-  if (intent.table_token && intent.table_token !== token) {
+  if (intent.purpose === "dine_in_bill" && intent.table_token && intent.table_token !== tokenOrRid) {
     return { ok: false, status: "unauthorized", error: "Unauthorized table reference" };
+  }
+
+  if (intent.purpose === "reservation_deposit" && intent.reservation_id && intent.reservation_id !== tokenOrRid) {
+    return { ok: false, status: "unauthorized", error: "Unauthorized reservation reference" };
   }
 
   if (intent.status === "succeeded") {
     const { data: payment } = await admin.from("payments").select("*").eq("intent_id", intentId).maybeSingle();
-    const { data: table } = await admin.from("restaurant_tables").select("label").eq("token", token).single();
+    let tableLabel = "Reservation Deposit";
+    if (intent.purpose === "dine_in_bill" && tokenOrRid) {
+      const { data: table } = await admin.from("restaurant_tables").select("label").eq("token", tokenOrRid).single();
+      tableLabel = table?.label ?? "—";
+    }
     if (payment) {
       return {
         ok: true,
@@ -227,11 +238,12 @@ export async function checkPaymentIntentStatus(intentId: string, token: string):
         receipt: {
           code: payment.receipt_code,
           amount: Number(payment.paid_amount),
-          table: table?.label ?? "—",
+          table: tableLabel,
           method: "online"
         }
       };
     }
+    return { ok: true, status: "succeeded" };
   }
 
   if (intent.status === "failed") {
@@ -349,63 +361,191 @@ export async function createReservation(
   return { ok: true, id: data.id, deposit, payEnabled };
 }
 
-async function settleReservation(rid: string, ref: string): Promise<{ ok: boolean; error?: string }> {
-  const admin = createAdminClient();
-  const { data: r } = await admin.from("reservations").select("deposit_amount,deposit_status").eq("id", rid).single();
-  if (!r) return { ok: false, error: "Reservation not found." };
-  if (r.deposit_status === "paid") return { ok: true };
-  await admin.from("reservations").update({ deposit_status: "paid", status: "confirmed" }).eq("id", rid);
-  await admin.from("payments").insert({
-    reservation_id: rid, amount: Number(r.deposit_amount), currency: "inr",
-    provider: GATEWAY(), stripe_payment_intent: ref, status: "paid",
-  });
-  return { ok: true };
-}
-
 export async function startReservationDeposit(rid: string): Promise<StartResult> {
   if (!paymentsEnabled()) return { ok: false, error: "Deposits are not enabled." };
+  if (!serviceRoleConfigured()) return { ok: false, error: "Server not configured (service role key)." };
   const admin = createAdminClient();
-  const { data: r } = await admin.from("reservations").select("deposit_amount,name").eq("id", rid).single();
-  if (!r) return { ok: false, error: "Reservation not found." };
-  const paise = Math.round(Number(r.deposit_amount) * 100);
-  if (paise <= 0) return { ok: false, error: "No deposit due." };
 
-  if (GATEWAY() === "razorpay") {
-    const keyId = process.env.RAZORPAY_KEY_ID!, keySecret = process.env.RAZORPAY_KEY_SECRET!;
-    const res = await fetch("https://api.razorpay.com/v1/orders", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: "Basic " + Buffer.from(`${keyId}:${keySecret}`).toString("base64") },
-      body: JSON.stringify({ amount: paise, currency: "INR", notes: { rid } }),
-    });
-    if (!res.ok) return { ok: false, error: "Razorpay error (" + res.status + ")." };
-    const order = await res.json();
-    return { ok: true, gateway: "razorpay", orderId: order.id, keyId, amount: paise, name: "Lumière Deposit", label: "Reservation" };
+  // 1. Confirm reservation exists
+  const { data: r } = await admin.from("reservations").select("*").eq("id", rid).single();
+  if (!r) return { ok: false, error: "Reservation not found." };
+
+  // 2. Confirm eligibility for deposit payment
+  if (r.status === "cancelled" || r.status === "no_show") {
+    return { ok: false, error: "Reservation is no longer active." };
+  }
+  if (r.deposit_status === "paid" || r.status === "confirmed") {
+    return { ok: false, error: "Deposit has already been paid for this reservation." };
   }
 
-  const cs = await stripe.checkout.sessions.create({
-    mode: "payment",
-    line_items: [{ price_data: { currency: "inr", product_data: { name: "Lumière — Reservation Deposit" }, unit_amount: paise }, quantity: 1 }],
-    success_url: `${SITE()}/reservations?dep=1&rid=${rid}&cs={CHECKOUT_SESSION_ID}`,
-    cancel_url: `${SITE()}/reservations?dep=cancel`,
-    metadata: { rid },
-  });
-  return { ok: true, gateway: "stripe", url: cs.url ?? "" };
+  // 3. Resolve authoritative deposit amount server-side
+  const depositAmount = RES_DEPOSIT();
+  const paise = Math.round(depositAmount * 100);
+  if (paise <= 0) return { ok: false, error: "No deposit due." };
+
+  // 4. Create payment_intents row
+  if (GATEWAY() === "razorpay") {
+    const keyId = process.env.RAZORPAY_KEY_ID;
+    const keySecret = process.env.RAZORPAY_KEY_SECRET;
+    if (!keyId || !keySecret) return { ok: false, error: "Online payment is not set up yet." };
+
+    const { data: intent, error: intentErr } = await admin.from("payment_intents").insert({
+      purpose: "reservation_deposit",
+      reservation_id: rid,
+      expected_amount: depositAmount,
+      currency: "INR",
+      provider: "razorpay",
+      status: "created",
+      metadata: { reservation_id: rid, name: r.name, email: r.email }
+    }).select("id").single();
+
+    if (intentErr || !intent) {
+      return { ok: false, error: "Failed to initialize deposit payment intent." };
+    }
+
+    try {
+      const res = await fetch("https://api.razorpay.com/v1/orders", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Basic " + Buffer.from(`${keyId}:${keySecret}`).toString("base64"),
+        },
+        body: JSON.stringify({
+          amount: paise,
+          currency: "INR",
+          notes: { intent_id: intent.id, rid }
+        }),
+      });
+
+      if (!res.ok) {
+        await admin.from("payment_intents").update({ status: "failed", failure_reason: `Razorpay HTTP ${res.status}` }).eq("id", intent.id);
+        return { ok: false, error: "Razorpay order creation failed (" + res.status + ")." };
+      }
+
+      const order = await res.json();
+
+      await admin.from("payment_intents").update({
+        provider_order_id: order.id,
+        status: "processing"
+      }).eq("id", intent.id);
+
+      return {
+        ok: true,
+        gateway: "razorpay",
+        intentId: intent.id,
+        orderId: order.id,
+        keyId,
+        amount: paise,
+        name: "Lumière Deposit",
+        label: "Table Reservation"
+      };
+    } catch (e) {
+      await admin.from("payment_intents").update({ status: "failed", failure_reason: e instanceof Error ? e.message : "Razorpay error" }).eq("id", intent.id);
+      return { ok: false, error: e instanceof Error ? e.message : "Razorpay error" };
+    }
+  }
+
+  // Default: Stripe Checkout Session
+  if (!stripeConfigured()) return { ok: false, error: "Online payment is not set up yet." };
+
+  const { data: intent, error: intentErr } = await admin.from("payment_intents").insert({
+    purpose: "reservation_deposit",
+    reservation_id: rid,
+    expected_amount: depositAmount,
+    currency: "INR",
+    provider: "stripe",
+    status: "created",
+    metadata: { reservation_id: rid, name: r.name, email: r.email }
+  }).select("id").single();
+
+  if (intentErr || !intent) {
+    return { ok: false, error: "Failed to initialize deposit payment intent." };
+  }
+
+  try {
+    const cs = await stripe.checkout.sessions.create({
+      mode: "payment",
+      line_items: [{
+        price_data: { currency: "inr", product_data: { name: "Lumière — Reservation Deposit" }, unit_amount: paise },
+        quantity: 1,
+      }],
+      success_url: `${SITE()}/reservations?dep=1&intent_id=${intent.id}&rid=${rid}&cs={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${SITE()}/reservations?dep=cancel&intent_id=${intent.id}&rid=${rid}`,
+      metadata: { intent_id: intent.id, rid },
+    });
+
+    await admin.from("payment_intents").update({
+      provider_order_id: cs.id,
+      status: "processing"
+    }).eq("id", intent.id);
+
+    return { ok: true, gateway: "stripe", url: cs.url ?? "", intentId: intent.id };
+  } catch (e) {
+    await admin.from("payment_intents").update({ status: "failed", failure_reason: e instanceof Error ? e.message : "Stripe error" }).eq("id", intent.id);
+    return { ok: false, error: e instanceof Error ? e.message : "Stripe error" };
+  }
 }
 
-export async function confirmReservationDeposit(rid: string, cs: string): Promise<{ ok: boolean; error?: string }> {
-  if (!stripeConfigured()) return { ok: false, error: "Payments not configured." };
-  const session = await stripe.checkout.sessions.retrieve(cs);
-  if (session.payment_status !== "paid") return { ok: false, error: "Deposit not completed." };
-  const pi = typeof session.payment_intent === "string" ? session.payment_intent : cs;
-  return await settleReservation(rid, pi);
+// ---- Stripe: check reservation deposit status after redirect (non-settling lookup) ----
+export async function confirmReservationDeposit(rid: string, cs: string, intentId?: string): Promise<{ ok: boolean; error?: string }> {
+  if (!serviceRoleConfigured()) return { ok: false, error: "Payments not configured." };
+  const admin = createAdminClient();
+
+  let query = admin.from("payment_intents").select("id, status, reservation_id");
+  if (intentId) {
+    query = query.eq("id", intentId);
+  } else if (cs) {
+    query = query.eq("provider_order_id", cs);
+  } else {
+    return { ok: false, error: "Missing intent reference." };
+  }
+
+  const { data: intent } = await query.maybeSingle();
+  if (!intent) return { ok: false, error: "Payment intent not found." };
+  if (intent.reservation_id && intent.reservation_id !== rid) {
+    return { ok: false, error: "Reservation mismatch." };
+  }
+
+  if (intent.status === "succeeded") {
+    return { ok: true };
+  }
+
+  if (intent.status === "failed") {
+    return { ok: false, error: "Deposit payment failed." };
+  }
+
+  return { ok: false, error: "Deposit payment verification pending with bank." };
 }
 
+// ---- Razorpay: check reservation deposit status after modal (non-settling lookup) ----
 export async function verifyReservationDeposit(
   rid: string, orderId: string, paymentId: string, signature: string
 ): Promise<{ ok: boolean; error?: string }> {
   const secret = process.env.RAZORPAY_KEY_SECRET;
   if (!secret) return { ok: false, error: "Payments not configured." };
   const expected = createHmac("sha256", secret).update(`${orderId}|${paymentId}`).digest("hex");
-  if (expected !== signature) return { ok: false, error: "Signature verification failed." };
-  return await settleReservation(rid, paymentId);
+  if (expected !== signature) return { ok: false, error: "Payment signature verification failed." };
+
+  if (!serviceRoleConfigured()) return { ok: false, error: "Payments not configured." };
+  const admin = createAdminClient();
+
+  const { data: intent } = await admin.from("payment_intents").select("id, status, reservation_id")
+    .eq("provider_order_id", orderId)
+    .maybeSingle();
+
+  if (!intent) return { ok: false, error: "Payment intent not found." };
+  if (intent.reservation_id && intent.reservation_id !== rid) {
+    return { ok: false, error: "Reservation mismatch." };
+  }
+
+  if (intent.status === "succeeded") {
+    return { ok: true };
+  }
+
+  if (intent.status === "failed") {
+    return { ok: false, error: "Deposit payment failed." };
+  }
+
+  return { ok: false, error: "Deposit payment verification pending with bank." };
 }
+

@@ -18,13 +18,18 @@ const INFO: [React.ReactNode, string, string][] = [
 export default async function ReservationsPage({
   searchParams,
 }: {
-  searchParams: Promise<{ dep?: string; rid?: string; cs?: string }>;
+  searchParams: Promise<{ dep?: string; rid?: string; intent_id?: string; cs?: string }>;
 }) {
-  const { dep, rid, cs } = await searchParams;
+  const { dep, rid, intent_id, cs } = await searchParams;
   let depositPaid = false;
-  if (dep === "1" && rid && cs) {
-    const res = await confirmReservationDeposit(rid, cs);
-    depositPaid = res.ok;
+  let verificationPending = false;
+  if (dep === "1" && rid && (cs || intent_id)) {
+    const res = await confirmReservationDeposit(rid, cs ?? "", intent_id);
+    if (res.ok) {
+      depositPaid = true;
+    } else {
+      verificationPending = true;
+    }
   }
 
   const supabase = await createClient();
@@ -36,8 +41,15 @@ export default async function ReservationsPage({
       <section className="py-16 bg-cream">
         {depositPaid && (
           <div className="mx-auto max-w-6xl px-5 mb-8">
-            <div className="flex items-center gap-3 bg-green-50 border border-green-300 text-green-800 rounded-2xl p-4">
-              <CheckCircle2 size={22} /> Deposit received — your table is confirmed. A confirmation email is on its way.
+            <div className="flex items-center gap-3 bg-green-50 border border-green-300 text-green-800 rounded-2xl p-4 text-sm font-medium">
+              <CheckCircle2 size={22} className="shrink-0" /> Deposit received — your table reservation is confirmed. A confirmation email is on its way.
+            </div>
+          </div>
+        )}
+        {verificationPending && !depositPaid && (
+          <div className="mx-auto max-w-6xl px-5 mb-8">
+            <div className="flex items-center gap-3 bg-amber-50 border border-amber-300 text-amber-800 rounded-2xl p-4 text-sm font-medium">
+              <Clock size={22} className="shrink-0 animate-pulse" /> Deposit payment submitted — awaiting bank webhook verification to confirm table reservation.
             </div>
           </div>
         )}

@@ -93,7 +93,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "Provider mismatch" }, { status: 400 });
     }
 
-    if (intent.purpose !== "dine_in_bill") {
+    if (intent.purpose !== "dine_in_bill" && intent.purpose !== "reservation_deposit") {
       await admin.from("webhook_events").update({ status: "ignored" }).eq("event_id", eventId);
       return NextResponse.json({ status: "ignored" }, { status: 200 });
     }

@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { CalendarCheck, CheckCircle2, Loader2, Plus, Minus } from "lucide-react";
-import { createReservation, startReservationDeposit, verifyReservationDeposit } from "@/actions/pay";
+import { createReservation, startReservationDeposit, verifyReservationDeposit, checkPaymentIntentStatus } from "@/actions/pay";
 import { money } from "@/data/menu";
 import type { MenuItem } from "@/lib/order";
 
@@ -10,7 +10,7 @@ import type { MenuItem } from "@/lib/order";
 
 export default function ReservationForm({ menu = [] }: { menu?: MenuItem[] }) {
   const today = new Date().toLocaleDateString("en-CA"); // YYYY-MM-DD local
-  const [state, setState] = useState<"idle" | "loading" | "done">("idle");
+  const [state, setState] = useState<"idle" | "loading" | "verifying" | "done">("idle");
   const [error, setError] = useState<string | null>(null);
   const [showPre, setShowPre] = useState(false);
   const [pre, setPre] = useState<Record<string, number>>({});
@@ -33,6 +33,28 @@ export default function ReservationForm({ menu = [] }: { menu?: MenuItem[] }) {
     });
   }
 
+  async function pollVerification(intentId: string, rid: string) {
+    setState("verifying");
+    let attempts = 0;
+    const maxAttempts = 15;
+    const interval = setInterval(async () => {
+      attempts++;
+      const res = await checkPaymentIntentStatus(intentId, rid);
+      if (res.ok && res.status === "succeeded") {
+        clearInterval(interval);
+        setState("done");
+      } else if (res.status === "failed" || attempts >= maxAttempts) {
+        clearInterval(interval);
+        if (res.status === "failed") {
+          setError(res.error || "Deposit payment failed.");
+        } else {
+          setError("Payment verification is pending. Please check your email for confirmation.");
+        }
+        setState("idle");
+      }
+    }, 2000);
+  }
+
   async function submit(e: React.FormEvent) {
     e.preventDefault();
     setState("loading"); setError(null);
@@ -47,12 +69,17 @@ export default function ReservationForm({ menu = [] }: { menu?: MenuItem[] }) {
       const ok = await loadRz(); const w = window as any;
       if (!ok || !w.Razorpay) { setError("Could not load payment window."); setState("idle"); return; }
       const rid = res.id;
+      const intentId = pay.intentId;
       const rzp = new w.Razorpay({
         key: pay.keyId, amount: pay.amount, currency: "INR", name: pay.name,
         description: "Table reservation deposit", order_id: pay.orderId, theme: { color: "#7a2e35" },
         handler: async (r: any) => {
-          const v = await verifyReservationDeposit(rid, r.razorpay_order_id, r.razorpay_payment_id, r.razorpay_signature);
-          if (v.ok) setState("done"); else { setError(v.error ?? "Deposit not verified."); setState("idle"); }
+          if (intentId) {
+            await verifyReservationDeposit(rid, r.razorpay_order_id, r.razorpay_payment_id, r.razorpay_signature);
+            await pollVerification(intentId, rid);
+          } else {
+            setState("done");
+          }
         },
         modal: { ondismiss: () => setState("idle") },
       });
@@ -62,14 +89,29 @@ export default function ReservationForm({ menu = [] }: { menu?: MenuItem[] }) {
     setState("done");
   }
 
+  if (state === "verifying") {
+    return (
+      <div className="bg-white rounded-2xl p-10 text-center shadow-[0_8px_30px_rgba(0,0,0,0.06)]">
+        <Loader2 size={48} className="animate-spin text-gold mx-auto mb-4" />
+        <h3 className="font-serif text-2xl mb-2">Verifying Payment...</h3>
+        <p className="text-neutral-500">
+          Please wait while we confirm your deposit payment with the bank.
+        </p>
+      </div>
+    );
+  }
+
   if (state === "done") {
     return (
       <div className="bg-white rounded-2xl p-10 text-center shadow-[0_8px_30px_rgba(0,0,0,0.06)]">
         <CheckCircle2 size={48} className="text-gold mx-auto mb-4" />
-        <h3 className="font-serif text-2xl mb-2">Table Requested</h3>
-        <p className="text-neutral-500">
-          Thank you. Our maître d&apos; will confirm your reservation by email shortly.
+        <h3 className="font-serif text-2xl mb-2">Reservation Confirmed</h3>
+        <p className="text-neutral-500 mb-4">
+          Thank you! Your deposit payment has been received and your table is confirmed. Our maître d&apos; will send a confirmation email shortly.
         </p>
+        <span className="inline-block bg-cream2 text-wine font-medium text-xs px-3 py-1.5 rounded-full">
+          Deposit Paid: ₹500
+        </span>
       </div>
     );
   }
@@ -151,3 +193,4 @@ export default function ReservationForm({ menu = [] }: { menu?: MenuItem[] }) {
     </form>
   );
 }
+
