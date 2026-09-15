@@ -10,15 +10,15 @@ export default async function TablePage({
   searchParams,
 }: {
   params: Promise<{ token: string }>;
-  searchParams: Promise<{ paid?: string; cs?: string }>;
+  searchParams: Promise<{ paid?: string; cs?: string; intent_id?: string }>;
 }) {
   const { token } = await params;
-  const { paid, cs } = await searchParams;
+  const { paid, cs, intent_id } = await searchParams;
 
-  // returning from Stripe Checkout: verify + settle
+  // returning from Stripe Checkout: non-settling status check if webhook already settled intent
   let receipt: Receipt | null = null;
-  if (paid === "1" && cs) {
-    const res = await confirmBillPayment(token, cs);
+  if (paid === "1" && (cs || intent_id)) {
+    const res = await confirmBillPayment(token, cs || "", intent_id);
     if (res.ok && res.receipt) receipt = res.receipt;
   }
 

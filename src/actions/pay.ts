@@ -10,8 +10,8 @@ export type Receipt = { code: string; amount: number; table: string; method: str
 
 // Result of starting a payment — either a redirect (Stripe) or modal params (Razorpay).
 export type StartResult =
-  | { ok: true; gateway: "stripe"; url: string }
-  | { ok: true; gateway: "razorpay"; orderId: string; keyId: string; amount: number; name: string; label: string }
+  | { ok: true; gateway: "stripe"; url: string; intentId?: string }
+  | { ok: true; gateway: "razorpay"; intentId?: string; orderId: string; keyId: string; amount: number; name: string; label: string }
   | { ok: false; error: string };
 
 const SITE = () => process.env.NEXT_PUBLIC_SITE_URL || "http://localhost:3000";
@@ -74,17 +74,47 @@ async function setSessionTip(token: string, tip: number) {
 
 // ---- Start a payment (gateway chosen by PAYMENT_GATEWAY env) ----
 export async function startBillPayment(token: string, tip = 0): Promise<StartResult> {
-  const bill = await billTotal(token);
-  if (!bill) return { ok: false, error: "No open bill for this table." };
-  if (bill.total <= 0) return { ok: false, error: "Your bill is empty." };
+  if (!serviceRoleConfigured()) return { ok: false, error: "Server not configured (service role key)." };
+  const admin = createAdminClient();
+
+  const { data: table } = await admin.from("restaurant_tables").select("id,label").eq("token", token).single();
+  if (!table) return { ok: false, error: "Table not found." };
+
+  const { data: sess } = await admin.from("dining_sessions").select("id,status,payment_status")
+    .eq("table_id", table.id).in("status", ["open", "bill_pending"])
+    .order("created_at", { ascending: false }).limit(1).single();
+  if (!sess) return { ok: false, error: "No open bill for this table." };
+
+  const { data: orders } = await admin.from("session_orders").select("amount").eq("session_id", sess.id);
+  const orderTotal = (orders ?? []).reduce((s, o) => s + Number(o.amount), 0);
+  if (orderTotal <= 0) return { ok: false, error: "Your bill is empty." };
+
   const t = Number.isFinite(tip) && tip > 0 ? Math.round(tip) : 0;
   await setSessionTip(token, t);
-  const paise = Math.round((bill.total + t) * 100);
+  const grandTotal = orderTotal + t;
+  const paise = Math.round(grandTotal * 100);
 
   if (GATEWAY() === "razorpay") {
     const keyId = process.env.RAZORPAY_KEY_ID;
     const keySecret = process.env.RAZORPAY_KEY_SECRET;
     if (!keyId || !keySecret) return { ok: false, error: "Online payment is not set up yet." };
+
+    const { data: intent, error: intentErr } = await admin.from("payment_intents").insert({
+      purpose: "dine_in_bill",
+      session_id: sess.id,
+      table_token: token,
+      expected_amount: grandTotal,
+      currency: "INR",
+      tip_amount: t,
+      provider: "razorpay",
+      status: "created",
+      metadata: { token, session_id: sess.id, table_label: table.label }
+    }).select("id").single();
+
+    if (intentErr || !intent) {
+      return { ok: false, error: "Failed to initialize payment intent." };
+    }
+
     try {
       const res = await fetch("https://api.razorpay.com/v1/orders", {
         method: "POST",
@@ -92,49 +122,151 @@ export async function startBillPayment(token: string, tip = 0): Promise<StartRes
           "Content-Type": "application/json",
           Authorization: "Basic " + Buffer.from(`${keyId}:${keySecret}`).toString("base64"),
         },
-        body: JSON.stringify({ amount: paise, currency: "INR", notes: { token } }),
+        body: JSON.stringify({
+          amount: paise,
+          currency: "INR",
+          notes: { intent_id: intent.id, token, session_id: sess.id }
+        }),
       });
-      if (!res.ok) return { ok: false, error: "Razorpay error (" + res.status + ")." };
+
+      if (!res.ok) {
+        await admin.from("payment_intents").update({ status: "failed", failure_reason: `Razorpay HTTP ${res.status}` }).eq("id", intent.id);
+        return { ok: false, error: "Razorpay order creation failed (" + res.status + ")." };
+      }
+
       const order = await res.json();
-      return { ok: true, gateway: "razorpay", orderId: order.id, keyId, amount: paise, name: "Lumière", label: bill.label };
+
+      await admin.from("payment_intents").update({
+        provider_order_id: order.id,
+        status: "processing"
+      }).eq("id", intent.id);
+
+      return {
+        ok: true,
+        gateway: "razorpay",
+        intentId: intent.id,
+        orderId: order.id,
+        keyId,
+        amount: paise,
+        name: "Lumière",
+        label: table.label
+      };
     } catch (e) {
+      await admin.from("payment_intents").update({ status: "failed", failure_reason: e instanceof Error ? e.message : "Razorpay error" }).eq("id", intent.id);
       return { ok: false, error: e instanceof Error ? e.message : "Razorpay error" };
     }
   }
 
   // default: Stripe hosted checkout (redirect)
   if (!stripeConfigured()) return { ok: false, error: "Online payment is not set up yet." };
+
+  const { data: intent, error: intentErr } = await admin.from("payment_intents").insert({
+    purpose: "dine_in_bill",
+    session_id: sess.id,
+    table_token: token,
+    expected_amount: grandTotal,
+    currency: "INR",
+    tip_amount: t,
+    provider: "stripe",
+    status: "created",
+    metadata: { token, session_id: sess.id, table_label: table.label }
+  }).select("id").single();
+
+  if (intentErr || !intent) {
+    return { ok: false, error: "Failed to initialize payment intent." };
+  }
+
   try {
     const cs = await stripe.checkout.sessions.create({
       mode: "payment",
       line_items: [{
-        price_data: { currency: "inr", product_data: { name: `Table ${bill.label} — Lumière` }, unit_amount: paise },
+        price_data: { currency: "inr", product_data: { name: `Table ${table.label} — Lumière` }, unit_amount: paise },
         quantity: 1,
       }],
-      success_url: `${SITE()}/t/${token}?paid=1&cs={CHECKOUT_SESSION_ID}`,
+      success_url: `${SITE()}/t/${token}?paid=1&intent_id=${intent.id}&cs={CHECKOUT_SESSION_ID}`,
       cancel_url: `${SITE()}/t/${token}`,
-      metadata: { token },
+      metadata: { intent_id: intent.id, token, session_id: sess.id },
     });
-    return { ok: true, gateway: "stripe", url: cs.url ?? "" };
+
+    await admin.from("payment_intents").update({
+      provider_order_id: cs.id,
+      status: "processing"
+    }).eq("id", intent.id);
+
+    return { ok: true, gateway: "stripe", url: cs.url ?? "", intentId: intent.id };
   } catch (e) {
+    await admin.from("payment_intents").update({ status: "failed", failure_reason: e instanceof Error ? e.message : "Stripe error" }).eq("id", intent.id);
     return { ok: false, error: e instanceof Error ? e.message : "Stripe error" };
   }
 }
 
-// ---- Stripe: verify + settle after redirect ----
-export async function confirmBillPayment(token: string, cs: string): Promise<{ ok: boolean; receipt?: Receipt; error?: string }> {
-  if (!stripeConfigured()) return { ok: false, error: "Payments not configured." };
-  try {
-    const session = await stripe.checkout.sessions.retrieve(cs);
-    if (session.payment_status !== "paid") return { ok: false, error: "Payment not completed." };
-    const pi = typeof session.payment_intent === "string" ? session.payment_intent : cs;
-    return await settle(token, pi, "online");
-  } catch (e) {
-    return { ok: false, error: e instanceof Error ? e.message : "Could not verify payment." };
+// Check status of a payment intent (used for frontend polling/verification)
+export async function checkPaymentIntentStatus(intentId: string, token: string): Promise<{
+  ok: boolean;
+  status: string;
+  receipt?: Receipt;
+  error?: string;
+}> {
+  if (!serviceRoleConfigured() || !intentId) return { ok: false, status: "error", error: "Invalid parameters" };
+  const admin = createAdminClient();
+
+  const { data: intent } = await admin.from("payment_intents").select("*").eq("id", intentId).single();
+  if (!intent) return { ok: false, status: "not_found", error: "Payment intent not found" };
+
+  if (intent.table_token && intent.table_token !== token) {
+    return { ok: false, status: "unauthorized", error: "Unauthorized table reference" };
   }
+
+  if (intent.status === "succeeded") {
+    const { data: payment } = await admin.from("payments").select("*").eq("intent_id", intentId).maybeSingle();
+    const { data: table } = await admin.from("restaurant_tables").select("label").eq("token", token).single();
+    if (payment) {
+      return {
+        ok: true,
+        status: "succeeded",
+        receipt: {
+          code: payment.receipt_code,
+          amount: Number(payment.paid_amount),
+          table: table?.label ?? "—",
+          method: "online"
+        }
+      };
+    }
+  }
+
+  if (intent.status === "failed") {
+    return { ok: false, status: "failed", error: intent.failure_reason || "Payment verification failed." };
+  }
+
+  return { ok: true, status: intent.status };
 }
 
-// ---- Razorpay: verify signature + settle after modal success ----
+// ---- Stripe: check payment intent status after redirect (non-settling lookup) ----
+export async function confirmBillPayment(token: string, cs: string, intentId?: string): Promise<{ ok: boolean; receipt?: Receipt; error?: string }> {
+  if (!serviceRoleConfigured()) return { ok: false, error: "Payments not configured." };
+  const admin = createAdminClient();
+
+  let query = admin.from("payment_intents").select("id, status");
+  if (intentId) {
+    query = query.eq("id", intentId);
+  } else if (cs) {
+    query = query.eq("provider_order_id", cs);
+  } else {
+    return { ok: false, error: "Missing intent reference." };
+  }
+
+  const { data: intent } = await query.maybeSingle();
+  if (!intent) return { ok: false, error: "Payment intent not found." };
+
+  if (intent.status === "succeeded") {
+    const res = await checkPaymentIntentStatus(intent.id, token);
+    if (res.ok && res.receipt) return { ok: true, receipt: res.receipt };
+  }
+
+  return { ok: false, error: "Payment verification pending." };
+}
+
+// ---- Razorpay: check payment intent status after modal (non-settling lookup) ----
 export async function verifyRazorpayPayment(
   token: string, orderId: string, paymentId: string, signature: string
 ): Promise<{ ok: boolean; receipt?: Receipt; error?: string }> {
@@ -142,7 +274,22 @@ export async function verifyRazorpayPayment(
   if (!secret) return { ok: false, error: "Payments not configured." };
   const expected = createHmac("sha256", secret).update(`${orderId}|${paymentId}`).digest("hex");
   if (expected !== signature) return { ok: false, error: "Payment signature verification failed." };
-  return await settle(token, paymentId, "online");
+
+  if (!serviceRoleConfigured()) return { ok: false, error: "Payments not configured." };
+  const admin = createAdminClient();
+
+  const { data: intent } = await admin.from("payment_intents").select("id, status")
+    .eq("provider_order_id", orderId)
+    .maybeSingle();
+
+  if (!intent) return { ok: false, error: "Payment intent not found." };
+
+  if (intent.status === "succeeded") {
+    const res = await checkPaymentIntentStatus(intent.id, token);
+    if (res.ok && res.receipt) return { ok: true, receipt: res.receipt };
+  }
+
+  return { ok: false, error: "Payment verification pending with bank." };
 }
 
 // ============================================================

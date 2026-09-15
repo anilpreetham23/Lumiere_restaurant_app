@@ -9,7 +9,7 @@ import {
 import QRCode from "qrcode";
 import { CreditCard } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
-import { startBillPayment, verifyRazorpayPayment, type Receipt } from "@/actions/pay";
+import { startBillPayment, checkPaymentIntentStatus, type Receipt } from "@/actions/pay";
 
 // Razorpay checkout.js injects a global constructor.
 declare global {
@@ -50,6 +50,8 @@ export default function TableOrder({
   const [err, setErr] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [payBusy, setPayBusy] = useState(false);
+  const [verifyingPay, setVerifyingPay] = useState(false);
+  const [activeIntentId, setActiveIntentId] = useState<string | null>(null);
   const [receiptQr, setReceiptQr] = useState<string | null>(null);
   const [localReceipt, setLocalReceipt] = useState<Receipt | null>(null);
   const effReceipt = receipt ?? localReceipt;
@@ -79,18 +81,22 @@ export default function TableOrder({
 
     if (res.gateway === "stripe") { window.location.href = res.url; return; }
 
-    // Razorpay modal
+    // Razorpay modal (Phase 2B: Intent-bound TEST mode)
     const loaded = await loadRazorpay();
     if (!loaded || !window.Razorpay) { setPayBusy(false); setErr("Could not load payment window."); return; }
+    
+    const intentId = res.intentId ?? null;
+    if (intentId) setActiveIntentId(intentId);
+
     const rzp = new window.Razorpay({
       key: res.keyId, amount: res.amount, currency: "INR",
       name: res.name, description: `Table ${res.label}`, order_id: res.orderId,
       theme: { color: "#7a2e35" },
-      handler: async (r: { razorpay_order_id: string; razorpay_payment_id: string; razorpay_signature: string }) => {
-        const v = await verifyRazorpayPayment(token, r.razorpay_order_id, r.razorpay_payment_id, r.razorpay_signature);
-        setPayBusy(false);
-        if (v.ok && v.receipt) { setLocalReceipt(v.receipt); setToast("Payment successful"); refresh(); }
-        else setErr(v.error ?? "Payment could not be verified.");
+      handler: async () => {
+        // Modal callback: payment completed by customer at Razorpay
+        // Webhook handles authoritative settlement asynchronously.
+        // Frontend polls payment_intent status until backend confirmed.
+        setVerifyingPay(true);
       },
       modal: { ondismiss: () => setPayBusy(false) },
     } as Record<string, unknown>);
@@ -109,6 +115,48 @@ export default function TableOrder({
     const { data } = await supabase.rpc("get_session", { p_token: token });
     if (data) setSnap(data as SessionSnapshot);
   }, [supabase, token]);
+
+  // Async payment intent verification polling (Phase 2G & 3)
+  useEffect(() => {
+    if (!verifyingPay || !activeIntentId) return;
+    let attempts = 0;
+    const interval = setInterval(async () => {
+      attempts += 1;
+      const res = await checkPaymentIntentStatus(activeIntentId, token);
+      if (res.ok && res.status === "succeeded" && res.receipt) {
+        setLocalReceipt(res.receipt);
+        setVerifyingPay(false);
+        setPayBusy(false);
+        setToast("Payment verified & bill settled");
+        refresh();
+        clearInterval(interval);
+      } else if (res.status === "failed") {
+        setErr(res.error ?? "Payment verification failed.");
+        setVerifyingPay(false);
+        setPayBusy(false);
+        clearInterval(interval);
+      } else if (attempts >= 15) {
+        // Timed out waiting for webhook, refresh session state
+        setVerifyingPay(false);
+        setPayBusy(false);
+        refresh();
+        clearInterval(interval);
+      }
+    }, 2000);
+    return () => clearInterval(interval);
+  }, [verifyingPay, activeIntentId, token, refresh]);
+
+  // On mount: check if returning from Stripe redirect with intent_id or cs
+  useEffect(() => {
+    if (typeof window === "undefined" || effReceipt) return;
+    const params = new URLSearchParams(window.location.search);
+    const paid = params.get("paid");
+    const intentId = params.get("intent_id");
+    if (paid === "1" && intentId) {
+      setActiveIntentId(intentId);
+      setVerifyingPay(true);
+    }
+  }, [effReceipt]);
 
   // poll live status every 5s (secure: rpc respects the token)
   useEffect(() => {
@@ -357,11 +405,25 @@ export default function TableOrder({
                 </div>
                 <button
                   onClick={payOnline}
-                  disabled={payBusy}
+                  disabled={payBusy || verifyingPay}
                   className="w-full flex items-center justify-center gap-2 bg-ink text-cream rounded-2xl py-4 font-medium disabled:opacity-60"
                 >
-                  <CreditCard size={18} className="text-gold" />
-                  {payBusy ? "Redirecting to payment…" : `Pay online · ${money(payTotal)}`}
+                  {verifyingPay ? (
+                    <>
+                      <Loader2 className="animate-spin text-gold" size={18} />
+                      <span>Verifying payment with bank…</span>
+                    </>
+                  ) : payBusy ? (
+                    <>
+                      <Loader2 className="animate-spin text-gold" size={18} />
+                      <span>Opening payment window…</span>
+                    </>
+                  ) : (
+                    <>
+                      <CreditCard size={18} className="text-gold" />
+                      <span>{`Pay online · ${money(payTotal)}`}</span>
+                    </>
+                  )}
                 </button>
                 <p className="text-center text-xs text-neutral-500">
                   Or tap <b>Ask for bill</b> to pay by cash at the counter.
